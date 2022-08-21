@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
+	"log"
 	"math"
 	"os"
+	"time"
 
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/altair"
@@ -13,13 +16,19 @@ import (
 	"github.com/klauspost/compress/snappy"
 )
 
+const (
+	gcInterval = 30 * time.Minute
+)
+
 var (
 	keyBoundaries = []byte{0}
 	keySlot       = []byte{1}
 )
 
 type Store struct {
-	db *badger.DB
+	db     *badger.DB
+	ctx    context.Context
+	cancel func()
 }
 
 func OpenStore(network string) (*Store, error) {
@@ -30,7 +39,34 @@ func OpenStore(network string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Store{db: db}, nil
+
+	s := &Store{
+		db: db,
+	}
+	s.ctx, s.cancel = context.WithCancel(context.Background())
+
+	// Garbage collection.
+	go s.gc()
+
+	return s, nil
+}
+
+func (s *Store) gc() {
+	ticker := time.NewTicker(gcInterval)
+	defer ticker.Stop()
+	for {
+		start := time.Now()
+		err := s.db.RunValueLogGC(0.7)
+		if err != nil {
+			log.Printf("Error running value log GC: %v", err)
+		}
+		log.Printf("BadgerDB GC took %v", time.Since(start))
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func (s *Store) Filled(slot phase0.Slot) (bool, error) {
@@ -180,5 +216,6 @@ func (s *Store) Purge(from, to phase0.Slot) (deleted int, err error) {
 }
 
 func (s *Store) Close() error {
+	s.cancel()
 	return s.db.Close()
 }
