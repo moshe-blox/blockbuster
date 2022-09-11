@@ -35,7 +35,9 @@ func OpenStore(network string) (*Store, error) {
 	if err := os.MkdirAll("./data", 0755); err != nil {
 		return nil, err
 	}
-	db, err := badger.Open(badger.DefaultOptions("./data/" + network))
+	opt := badger.DefaultOptions("./data/" + network)
+	opt.Logger = nil
+	db, err := badger.Open(opt)
 	if err != nil {
 		return nil, err
 	}

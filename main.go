@@ -33,12 +33,12 @@ const (
 	scrapeSlots = 450 * 32 // 450 epochs (2 days)
 
 	// How many slots to fetch at once.
-	scrapeConcurrency = 3
+	scrapeConcurrency = 16
 )
 
 var targets = map[string]string{
-	// "prater":  "http://prater-standalone.stage.bloxinfra.com:3500",
-	"prater":  "http://localhost:3500",
+	"prater": "http://prater-standalone.stage.bloxinfra.com:3500",
+	// "prater":  "http://localhost:3500",
 	"sepolia": "http://hetz:5052",
 }
 
@@ -190,6 +190,7 @@ func scrape(ctx context.Context, store *Store, network, nodeURL string) error {
 	log.Printf("%-10s purged %d outdated slots, starting from slot %d", network, deleted, startSlot)
 
 	// Spawn goroutines to scrape the blocks.
+	printTicker := time.NewTicker(time.Second)
 	const rateInterval = 10 * time.Second
 	rate := ratecounter.NewRateCounter(rateInterval)
 	jobs := make(chan phase0.Slot)
@@ -223,12 +224,20 @@ func scrape(ctx context.Context, store *Store, network, nodeURL string) error {
 						block = nil
 					}
 
-					// Save it.
-					icon := "✅"
-					if block == nil {
-						icon = "❌"
+					// Print progress.
+					select {
+					case <-printTicker.C:
+						icon := "✅"
+						if block == nil {
+							icon = "❌"
+						}
+						slotsPerSecond := float64(rate.Rate()) / rateInterval.Seconds()
+						eta := time.Duration(float64(currentSlot-slot)/slotsPerSecond) * time.Second
+						log.Printf("%-10s %-8d %s %6.0f slots/s\teta: %s", network, slot, icon, slotsPerSecond, eta)
+					default:
 					}
-					log.Printf("%-10s %-8d %s %6.0f slots/s", network, slot, icon, float64(rate.Rate())/rateInterval.Seconds())
+
+					// Save it.
 					err = store.SetBlock(slot, block)
 					if err != nil {
 						errs <- errors.Wrap(err, "failed to set block")
