@@ -1,0 +1,11 @@
+version: '3.6'
+services:
+  blockbuster:
+    build: .
+    restart: on-failure
+    volumes:
+      - ./data:/blockbuster-data
+    command:
+      - /app/blockbuster
+      - -datadir
+      - /blockbuster-data

@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/attestantio/go-eth2-client/spec"
@@ -31,11 +32,11 @@ type Store struct {
 	cancel func()
 }
 
-func OpenStore(network string) (*Store, error) {
-	if err := os.MkdirAll("./data", 0755); err != nil {
+func OpenStore(dir, network string) (*Store, error) {
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
-	opt := badger.DefaultOptions("./data/" + network)
+	opt := badger.DefaultOptions(filepath.Join(dir, network))
 	opt.Logger = nil
 	db, err := badger.Open(opt)
 	if err != nil {
@@ -110,26 +111,41 @@ func (s *Store) Count() (slots, blocks int, err error) {
 	return
 }
 
-func (s *Store) Block(slot phase0.Slot) (*spec.VersionedSignedBeaconBlock, error) {
-	block := &spec.VersionedSignedBeaconBlock{}
+type BlockWithRoot struct {
+	BlockRoot phase0.Root
+	*spec.VersionedSignedBeaconBlock
+}
+
+func (s *Store) Block(slot phase0.Slot) (*BlockWithRoot, error) {
+	block := &BlockWithRoot{VersionedSignedBeaconBlock: &spec.VersionedSignedBeaconBlock{}}
 	err := s.db.View(func(txn *badger.Txn) error {
+		// 1) Read slot from key.
 		var slotBytes [8]byte
 		binary.BigEndian.PutUint64(slotBytes[:], uint64(slot))
 		item, err := txn.Get(append(keySlot, slotBytes[:]...))
 		if err != nil {
 			return err
 		}
+
+		// 2) Copy the value.
 		val, err := item.ValueCopy(nil)
 		if err != nil {
 			return err
 		}
+
+		// 2.1) Read version.
 		block.Version = spec.DataVersion(binary.BigEndian.Uint64(val[:8]))
 		if block.Version == spec.DataVersion(math.MaxInt) {
 			// No block for this slot.
 			block = nil
 			return nil
 		}
-		blockBytes, err := snappy.Decode(nil, val[8:])
+
+		// 2.2) Read root.
+		copy(block.BlockRoot[:], val[8:40])
+
+		// 2.3) Read block.
+		blockBytes, err := snappy.Decode(nil, val[40:])
 		if err != nil {
 			return err
 		}
@@ -155,7 +171,7 @@ func (s *Store) Block(slot phase0.Slot) (*spec.VersionedSignedBeaconBlock, error
 	return block, err
 }
 
-func (s *Store) SetBlock(slot phase0.Slot, block *spec.VersionedSignedBeaconBlock) error {
+func (s *Store) SetBlock(slot phase0.Slot, block *BlockWithRoot) error {
 	return s.db.Update(func(txn *badger.Txn) error {
 		var slotBytes [8]byte
 		binary.BigEndian.PutUint64(slotBytes[:], uint64(slot))
@@ -165,6 +181,11 @@ func (s *Store) SetBlock(slot phase0.Slot, block *spec.VersionedSignedBeaconBloc
 			binary.BigEndian.PutUint64(versionBytes[:], math.MaxInt)
 		} else {
 			binary.BigEndian.PutUint64(versionBytes[:], uint64(block.Version))
+		}
+
+		var root phase0.Root
+		if block != nil {
+			root = block.BlockRoot
 		}
 
 		var blockBytes []byte
@@ -187,7 +208,15 @@ func (s *Store) SetBlock(slot phase0.Slot, block *spec.VersionedSignedBeaconBloc
 			blockBytes = snappy.Encode(nil, b)
 		}
 
-		return txn.Set(append(keySlot, slotBytes[:]...), append(versionBytes[:], blockBytes...))
+		value := make([]byte, 0, len(versionBytes)+len(root)+len(blockBytes))
+		value = append(value, versionBytes[:]...)
+		value = append(value, root[:]...)
+		value = append(value, blockBytes[:]...)
+
+		return txn.Set(
+			append(keySlot, slotBytes[:]...),
+			value,
+		)
 	})
 }
 

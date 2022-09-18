@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -37,18 +39,25 @@ const (
 )
 
 var targets = map[string]string{
-	"prater": "http://prater-standalone.stage.bloxinfra.com:3500",
+	// "prater": "http://prater-standalone.stage.bloxinfra.com:3500",
 	// "prater":  "http://localhost:3500",
-	"sepolia": "http://hetz:5052",
+	"prater":  "http://eth2-lh-prater-5052.stage.bloxinfra.com",
+	"sepolia": "http://195.201.57.53:5052",
+	"mainnet": "http://mainnet-standalone.stage.bloxinfra.com:3500",
 }
+
+var (
+	dataDir = flag.String("datadir", "./data", "")
+)
 
 var stores = hashmap.New[string, *Store]()
 
 func main() {
+	flag.Parse()
 	ctx, cancel := context.WithCancel(context.Background())
 
 	for network, nodeURL := range targets {
-		networkStore, err := OpenStore(network)
+		networkStore, err := OpenStore(*dataDir, network)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -89,6 +98,7 @@ func main() {
 			return echo.NewHTTPError(http.StatusNotFound, "block not scraped")
 		}
 		if err != nil {
+			log.Printf("Error getting block: %v", err)
 			return err
 		}
 		if block == nil {
@@ -99,9 +109,11 @@ func main() {
 		}
 		var resp struct {
 			Version string      `json:"version"`
+			Root    string      `json:"root"`
 			Data    interface{} `json:"data"`
 		}
 		resp.Version = strings.ToLower(block.Version.String())
+		resp.Root = "0x" + hex.EncodeToString(block.BlockRoot[:])
 		switch block.Version {
 		case spec.DataVersionPhase0:
 			resp.Data = block.Phase0
@@ -238,7 +250,16 @@ func scrape(ctx context.Context, store *Store, network, nodeURL string) error {
 					}
 
 					// Save it.
-					err = store.SetBlock(slot, block)
+					var blockWithRoot *BlockWithRoot
+					if block != nil {
+						blockWithRoot = &BlockWithRoot{VersionedSignedBeaconBlock: block}
+						blockWithRoot.BlockRoot, err = block.Root()
+						if err != nil {
+							errs <- errors.Wrap(err, "failed to get block root hash")
+							return
+						}
+					}
+					err = store.SetBlock(slot, blockWithRoot)
 					if err != nil {
 						errs <- errors.Wrap(err, "failed to set block")
 						return
@@ -250,6 +271,7 @@ func scrape(ctx context.Context, store *Store, network, nodeURL string) error {
 	}
 
 	// Scrape the blocks.
+	var headSlot phase0.Slot
 	for slot := startSlot; ; slot++ {
 		// Skip slot if it's already in the store.
 		exists, err := store.Filled(slot)
@@ -260,16 +282,27 @@ func scrape(ctx context.Context, store *Store, network, nodeURL string) error {
 			continue
 		}
 
-		// Wait for next block to be at least 8 slots behind.
-		futureSlot := genesisTime.Add(secondsPerSlot * time.Second * time.Duration(slot+8))
-		if time.Now().Before(futureSlot) {
+		// Wait for next block to be at least 12 slots behind.
+		futureSlot := slot + 12
+		futureSlotTime := genesisTime.Add(secondsPerSlot * time.Second * time.Duration(futureSlot))
+		if time.Now().Before(futureSlotTime) {
 			select {
-			case <-time.After(time.Until(futureSlot)):
+			case <-time.After(time.Until(futureSlotTime)):
 			case err := <-errs:
 				return err
 			case <-ctx.Done():
 				return nil
 			}
+		}
+
+		// Wait for Beacon node to catch up.
+		for headSlot < futureSlot {
+			syncState, err := svc.(client.NodeSyncingProvider).NodeSyncing(ctx)
+			if err != nil {
+				return err
+			}
+			headSlot = syncState.HeadSlot
+			time.Sleep(time.Second * secondsPerSlot)
 		}
 
 		// Get the next block.
